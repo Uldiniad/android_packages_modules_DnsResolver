@@ -19,10 +19,12 @@
 #include <gtest/gtest.h>
 #include <netdutils/NetNativeTestBase.h>
 #include <openssl/base64.h>
+#include <private/android_filesystem_config.h>
 #include <sysutils/SocketClient.h>
 
 #include "DnsProxyListener.h"
 #include "DnsResolver.h"
+#include "dnsproxyd_protocol/DnsProxydProtocol.h"
 #include "tests/dns_responder/dns_responder.h"
 #include "tests/resolv_test_callbacks.h"
 #include "tests/resolv_test_utils.h"
@@ -44,8 +46,10 @@ void PrintTo(const Answer& answer, std::ostream* os) {
 
 std::mutex gLock;
 std::vector<Answer> gAnswers;
+// The uids the answers were for.
+std::vector<uid_t> gUids;
 
-void recordAnswer(const android_net_context& /*netcontext*/, const char* name,
+void recordAnswer(const android_net_context& netcontext, const char* name,
                   const in6_addr* addresses, size_t count) {
     Answer answer = {.name = name};
     for (size_t i = 0; i < count; i++) {
@@ -54,11 +58,17 @@ void recordAnswer(const android_net_context& /*netcontext*/, const char* name,
     }
     std::lock_guard lock(gLock);
     gAnswers.push_back(answer);
+    gUids.push_back(netcontext.uid);
 }
 
 std::vector<Answer> answers() {
     std::lock_guard lock(gLock);
     return gAnswers;
+}
+
+std::vector<uid_t> uids() {
+    std::lock_guard lock(gLock);
+    return gUids;
 }
 
 // What netd gives the resolver for an app's lookup on the network.
@@ -129,6 +139,7 @@ class AnswerCallbackTest : public NetNativeTestBase {
                                             {"example.com"}, params, std::nullopt));
         std::lock_guard lock(gLock);
         gAnswers.clear();
+        gUids.clear();
     }
 
     void TearDown() override {
@@ -187,6 +198,20 @@ TEST_F(AnswerCallbackTest, ResNSendReportsTheAnswerBeforeTheAppGetsIt) {
     ASSERT_TRUE(dns.startServer());
     EXPECT_EQ((std::vector<Answer>{{"hello.example.com", {"::ffff:1.2.3.4"}}}),
               send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a)));
+}
+
+TEST_F(AnswerCallbackTest, RequestsAfterForUidAreForThatAppWhenTheCallerMayChargeIt) {
+    test::DNSResponder dns;
+    dns.addMapping(kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4);
+    ASSERT_TRUE(dns.startServer());
+    const std::string lookup = "getaddrinfo hello ^ 0 " + std::to_string(AF_INET) + " " +
+                               std::to_string(SOCK_STREAM) + " 0 " + mNetId;
+    send(lookup);
+    // As NetdClient sends them, in one write. Root, which runs this test, may charge others.
+    // Android's restrictions on the app, such as on apps in the background, don't stop it.
+    const uid_t app = 99 * AID_USER_OFFSET + AID_APP_START;
+    send(std::string(DNSPROXYD_FOR_UID " ") + std::to_string(app) + '\0' + lookup);
+    EXPECT_EQ((std::vector<uid_t>{getuid(), app}), uids());
 }
 
 TEST_F(AnswerCallbackTest, FailedLookupsReportNothing) {

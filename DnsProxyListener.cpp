@@ -32,9 +32,12 @@
 #define LOG_TAG "resolv"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <vector>
 
 #include <android-base/parseint.h>
+#include <android-base/thread_annotations.h>
 #include <android/multinetwork.h>  // ResNsendFlags
 #include <cutils/misc.h>           // FIRST_APPLICATION_UID
 #include <cutils/multiuser.h>
@@ -745,8 +748,33 @@ std::string makeThreadName(unsigned netId, uint32_t uid) {
 
 extern "C" int ADnsHelper_init();
 extern "C" int ADnsHelper_isUidNetworkingBlocked(uid_t, bool);
+extern "C" int ADnsHelper_isUidOemDenied(uid_t);
+extern "C" int ADnsHelper_hasUpdateDeviceStatsPermission(uid_t);
 
-bool isUidNetworkingBlocked(uid_t uid, unsigned netId) {
+// The app a client's next request is for, as its "foruid" command named it, with the uid and pid
+// that sent it, so a client object reused for another connection doesn't inherit it.
+struct ForUid {
+    uid_t callerUid;
+    pid_t callerPid;
+    uid_t uid;
+};
+std::mutex sForUidLock;
+std::map<SocketClient*, ForUid> sForUid GUARDED_BY(sForUidLock);
+
+// The uid a request counts as: the client's, or the app its "foruid" command named.
+uid_t requestUid(SocketClient* cli) {
+    std::lock_guard guard(sForUidLock);
+    const auto it = sForUid.find(cli);
+    if (it == sForUid.end()) return cli->getUid();
+    const ForUid forUid = it->second;
+    sForUid.erase(it);
+    if (forUid.callerUid != cli->getUid() || forUid.callerPid != cli->getPid()) {
+        return cli->getUid();
+    }
+    return forUid.uid;
+}
+
+bool isUidNetworkingBlocked(uid_t uid, unsigned netId, uid_t clientUid) {
     static const bool hasBPF = isAtLeastT();  // Related BPF maps were only mainlined from T.
     if (!hasBPF) return false;
 
@@ -757,7 +785,10 @@ bool isUidNetworkingBlocked(uid_t uid, unsigned netId) {
     // Feature flag that can disable the feature.
     if (!Experiments::getInstance()->getFlag("fail_fast_on_uid_network_blocking", 1)) return false;
 
-    return ADnsHelper_isUidNetworkingBlocked(uid, resolv_is_metered_network(netId)) == 1;
+    // A lookup for another app stops at the OEM's deny rules for it, which follow its tagged
+    // traffic; Android's other restrictions on the app only stop the app's own sockets.
+    if (uid != clientUid && ADnsHelper_isUidOemDenied(uid) == 1) return true;
+    return ADnsHelper_isUidNetworkingBlocked(clientUid, resolv_is_metered_network(netId)) == 1;
 }
 
 }  // namespace
@@ -778,7 +809,32 @@ DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
     mGetDnsNetIdCommand = std::make_unique<GetDnsNetIdCommand>();
     registerCmd(mGetDnsNetIdCommand.get());
 
+    mForUidCommand = std::make_unique<ForUidCommand>();
+    registerCmd(mForUidCommand.get());
+
     if (ADnsHelper_init()) abort();
+}
+
+DnsProxyListener::ForUidCommand::ForUidCommand() : FrameworkCommand(DNSPROXYD_FOR_UID) {}
+
+// Only callers that may charge traffic to other apps, as socket tagging requires, can name one.
+int DnsProxyListener::ForUidCommand::runCommand(SocketClient* cli, int argc, char** argv) {
+    uid_t uid;
+    if (argc != 2 || !ParseUint(argv[1], &uid)) return 0;
+    if (ADnsHelper_hasUpdateDeviceStatsPermission(cli->getUid()) != 1) {
+        LOG(WARNING) << "foruid: UID " << cli->getUid() << " may not act for other apps";
+        return 0;
+    }
+    std::lock_guard guard(sForUidLock);
+    sForUid[cli] = {cli->getUid(), cli->getPid(), uid};
+    return 0;
+}
+
+bool DnsProxyListener::onDataAvailable(SocketClient* c) {
+    if (FrameworkListener::onDataAvailable(c)) return true;
+    std::lock_guard guard(sForUidLock);
+    sForUid.erase(c);
+    return false;
 }
 
 void DnsProxyListener::Handler::spawn() {
@@ -949,7 +1005,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid, mClient->getUid());
     if (isUidBlocked) {
         LOG(INFO) << "GetAddrInfoHandler::run: network access blocked";
         rv = EAI_FAIL;
@@ -1056,7 +1112,7 @@ int DnsProxyListener::GetAddrInfoCmd::runCommand(SocketClient* cli, int argc, ch
         return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
 
     const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
-    const uid_t uid = cli->getUid();
+    const uid_t uid = requestUid(cli);
 
     android_net_context netcontext;
     gResNetdCallbacks.get_network_context(netId, uid, &netcontext);
@@ -1086,7 +1142,7 @@ DnsProxyListener::ResNSendCommand::ResNSendCommand() : FrameworkCommand("resnsen
 int DnsProxyListener::ResNSendCommand::runCommand(SocketClient* cli, int argc, char** argv) {
     logArguments(argc, argv);
 
-    const uid_t uid = cli->getUid();
+    const uid_t uid = requestUid(cli);
     if (argc != 4) {
         LOG(WARNING) << "ResNSendCommand::runCommand: resnsend: from UID " << uid
                      << ", invalid number of arguments to resnsend: " << argc;
@@ -1165,7 +1221,7 @@ void DnsProxyListener::ResNSendHandler::run() {
     int ansLen = -1;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid, mClient->getUid());
     if (isUidBlocked) {
         LOG(INFO) << "ResNSendHandler::run: network access blocked";
         ansLen = -ECONNREFUSED;
@@ -1257,7 +1313,7 @@ DnsProxyListener::GetDnsNetIdCommand::GetDnsNetIdCommand() : FrameworkCommand("g
 int DnsProxyListener::GetDnsNetIdCommand::runCommand(SocketClient* cli, int argc, char** argv) {
     logArguments(argc, argv);
 
-    const uid_t uid = cli->getUid();
+    const uid_t uid = requestUid(cli);
     if (argc != 2) {
         LOG(WARNING) << "GetDnsNetIdCommand::runCommand: getdnsnetid: from UID " << uid
                      << ", invalid number of arguments to getdnsnetid: " << argc;
@@ -1314,7 +1370,7 @@ int DnsProxyListener::GetHostByNameCmd::runCommand(SocketClient* cli, int argc, 
     std::string name = argv[2];
     if (!ParseInt(argv[3], &af))
         return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
-    uid_t uid = cli->getUid();
+    uid_t uid = requestUid(cli);
     const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
 
     android_net_context netcontext;
@@ -1393,7 +1449,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid, mClient->getUid());
     if (isUidBlocked) {
         LOG(INFO) << "GetHostByNameHandler::run: network access blocked";
         rv = EAI_FAIL;
@@ -1470,7 +1526,7 @@ int DnsProxyListener::GetHostByAddrCmd::runCommand(SocketClient* cli, int argc, 
         return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
     if (!ParseUint(argv[4], &netId))
         return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
-    uid_t uid = cli->getUid();
+    uid_t uid = requestUid(cli);
     const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
 
     in6_addr addr;
@@ -1558,7 +1614,7 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
 
-    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid, mClient->getUid());
     if (isUidBlocked) {
         LOG(INFO) << "GetHostByAddrHandler::run: network access blocked";
         rv = EAI_FAIL;

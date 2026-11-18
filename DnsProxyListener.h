@@ -165,11 +165,24 @@ class DnsProxyListener : public FrameworkListener {
         int runCommand(SocketClient* c, int argc, char** argv) override;
     };
 
+    /* ------ foruid ------*/
+    class ForUidCommand : public FrameworkCommand {
+      public:
+        ForUidCommand();
+        virtual ~ForUidCommand() {}
+        int runCommand(SocketClient* c, int argc, char** argv) override;
+    };
+
+  protected:
+    bool onDataAvailable(SocketClient* c) override;
+
+  private:
     std::unique_ptr<GetAddrInfoCmd> mGetAddrInfoCmd;
     std::unique_ptr<GetHostByAddrCmd> mGetHostByAddrCmd;
     std::unique_ptr<GetHostByNameCmd> mGetHostByNameCmd;
     std::unique_ptr<ResNSendCommand> mResNSendCommand;
     std::unique_ptr<GetDnsNetIdCommand> mGetDnsNetIdCommand;
+    std::unique_ptr<ForUidCommand> mForUidCommand;
 };
 
 }  // namespace net

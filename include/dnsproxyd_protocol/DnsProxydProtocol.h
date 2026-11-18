@@ -24,3 +24,10 @@
  * This flag must be kept in sync with the Network#getNetIdForResolv() usage.
  */
 #define NETID_USE_LOCAL_NAMESERVERS 0x80000000
+
+/*
+ * "foruid <uid>", which NetdClient sends ahead of a request on the same connection when the
+ * thread works for an app, as TrafficStats#setThreadStatsUid marks it. The request then counts as
+ * that app's, if the caller may charge traffic to other apps. It gets no reply of its own.
+ */
+#define DNSPROXYD_FOR_UID "foruid"
