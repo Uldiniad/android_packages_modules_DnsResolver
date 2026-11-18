@@ -43,6 +43,8 @@ bool resolv_init(const ResolverNetdCallbacks* callbacks) {
     gResNetdCallbacks.tagSocket = callbacks->tagSocket;
     gResNetdCallbacks.evaluate_domain_name = callbacks->evaluate_domain_name;
     // if any more fields are added they will need to be copied within api checks
+    // LineageOS: netd is always built with this resolver, so it passes the whole struct
+    gResNetdCallbacks.on_dns_answer = callbacks->on_dns_answer;
     android::net::gDnsResolv = android::net::DnsResolver::getInstance();
     return android::net::gDnsResolv->start();
 }

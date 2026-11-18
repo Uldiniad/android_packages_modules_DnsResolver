@@ -1,0 +1,200 @@
+/*
+ * SPDX-FileCopyrightText: The LineageOS Project
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define LOG_TAG "resolv_answer_callback_test"
+
+#include <arpa/inet.h>
+#include <arpa/nameser.h>
+#include <poll.h>
+#include <sys/socket.h>
+
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <android-base/unique_fd.h>
+#include <gtest/gtest.h>
+#include <netdutils/NetNativeTestBase.h>
+#include <openssl/base64.h>
+#include <sysutils/SocketClient.h>
+
+#include "DnsProxyListener.h"
+#include "DnsResolver.h"
+#include "tests/dns_responder/dns_responder.h"
+#include "tests/resolv_test_callbacks.h"
+#include "tests/resolv_test_utils.h"
+
+namespace android::net {
+namespace {
+
+using android::base::unique_fd;
+
+struct Answer {
+    std::string name;
+    std::vector<std::string> addresses;
+    bool operator==(const Answer&) const = default;
+};
+
+void PrintTo(const Answer& answer, std::ostream* os) {
+    *os << answer.name << " " << ::testing::PrintToString(answer.addresses);
+}
+
+std::mutex gLock;
+std::vector<Answer> gAnswers;
+
+void recordAnswer(const android_net_context& /*netcontext*/, const char* name,
+                  const in6_addr* addresses, size_t count) {
+    Answer answer = {.name = name};
+    for (size_t i = 0; i < count; i++) {
+        char text[INET6_ADDRSTRLEN];
+        answer.addresses.push_back(inet_ntop(AF_INET6, &addresses[i], text, sizeof(text)));
+    }
+    std::lock_guard lock(gLock);
+    gAnswers.push_back(answer);
+}
+
+std::vector<Answer> answers() {
+    std::lock_guard lock(gLock);
+    return gAnswers;
+}
+
+// What netd gives the resolver for an app's lookup on the network.
+void networkContext(uint32_t netId, uint32_t uid, android_net_context* netcontext) {
+    *netcontext = {.app_netid = netId,
+                   .app_mark = MARK_UNSET,
+                   .dns_netid = netId,
+                   .dns_mark = MARK_UNSET,
+                   .uid = uid};
+}
+
+// A query for the name's records of the type, base64-encoded as resnsend takes it.
+std::string query(const std::string& name, ns_type type) {
+    std::vector<uint8_t> packet = {0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0};
+    for (size_t start = 0; start <= name.size();) {
+        size_t end = std::min(name.find('.', start), name.size());
+        packet.push_back(static_cast<uint8_t>(end - start));
+        packet.insert(packet.end(), name.begin() + start, name.begin() + end);
+        start = end + 1;
+    }
+    packet.insert(packet.end(), {0, 0, static_cast<uint8_t>(type), 0, ns_c_in});
+    size_t length;
+    EVP_EncodedLength(&length, packet.size());
+    std::string encoded(length, '\0');
+    encoded.resize(EVP_EncodeBlock(reinterpret_cast<uint8_t*>(encoded.data()), packet.data(),
+                                   packet.size()));
+    return encoded;
+}
+
+// Takes an app's commands as netd's dnsproxyd socket does, from a socket pair.
+class TestListener : public DnsProxyListener {
+  public:
+    using DnsProxyListener::onDataAvailable;
+};
+
+// One for all tests and never destroyed, as netd's isn't: destroying a listener that never
+// started closes descriptors it doesn't own.
+TestListener& listener() {
+    static TestListener* listener = new TestListener();
+    return *listener;
+}
+
+}  // namespace
+
+class AnswerCallbackTest : public NetNativeTestBase {
+  protected:
+    void SetUp() override {
+        const ResolverNetdCallbacks callbacks = {
+                .check_calling_permission = &noop_checkCallingPermissionCallback,
+                .get_network_context = &networkContext,
+                .log = &noop_logCallback,
+                .tagSocket = &noop_tagSocketCallback,
+                .evaluate_domain_name = &noop_evaluateDomainNameCallback,
+                .on_dns_answer = &recordAnswer,
+        };
+        // Fails to listen, as netd holds the dnsproxyd socket, but takes the callbacks.
+        resolv_init(&callbacks);
+        gDnsResolv->resolverCtrl.createNetworkCache(TEST_NETID);
+        const res_params params = {
+                .sample_validity = 300,
+                .success_threshold = 25,
+                .min_samples = 8,
+                .max_samples = 8,
+                .base_timeout_msec = 1000,
+                .retry_count = 2,
+        };
+        ASSERT_EQ(0, resolv_set_nameservers(TEST_NETID, {test::kDefaultListenAddr},
+                                            {"example.com"}, params, std::nullopt));
+        std::lock_guard lock(gLock);
+        gAnswers.clear();
+    }
+
+    void TearDown() override {
+        resetDnsResolverCallbacks();
+        gDnsResolv->resolverCtrl.destroyNetworkCache(TEST_NETID);
+    }
+
+    // Sends the command as an app does. Returns what was reported by the time the reply reached
+    // the app, after the handler is done with the socket, so the next test gets its own.
+    std::vector<Answer> send(const std::string& command) {
+        int fds[2];
+        EXPECT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds));
+        unique_fd app(fds[0]);
+        SocketClient* client = new SocketClient(fds[1], true, false);
+        EXPECT_EQ(static_cast<ssize_t>(command.size() + 1),
+                  write(app.get(), command.c_str(), command.size() + 1));
+        listener().onDataAvailable(client);
+        client->decRef();
+        std::vector<Answer> reported;
+        bool replied = false;
+        char buffer[1024];
+        pollfd reply = {.fd = app.get(), .events = POLLIN};
+        while (poll(&reply, 1, 5000) == 1) {
+            if (!replied) reported = answers();
+            replied = true;
+            if (read(app.get(), buffer, sizeof(buffer)) <= 0) break;
+        }
+        EXPECT_TRUE(replied);
+        return reported;
+    }
+
+    const std::string mNetId = std::to_string(TEST_NETID);
+};
+
+TEST_F(AnswerCallbackTest, GetAddrInfoReportsTheAnswerBeforeTheAppGetsIt) {
+    test::DNSResponder dns;
+    dns.addMapping(kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4);
+    ASSERT_TRUE(dns.startServer());
+    // As Java's lookups ask: one result per address, not one per socket type.
+    EXPECT_EQ((std::vector<Answer>{{"hello", {"::ffff:1.2.3.4"}}}),
+              send("getaddrinfo hello ^ 0 " + std::to_string(AF_INET) + " " +
+                   std::to_string(SOCK_STREAM) + " 0 " + mNetId));
+}
+
+TEST_F(AnswerCallbackTest, GetHostByNameReportsTheAnswerBeforeTheAppGetsIt) {
+    test::DNSResponder dns;
+    dns.addMapping(kHelloExampleCom, ns_type::ns_t_aaaa, "2001:db8::1");
+    ASSERT_TRUE(dns.startServer());
+    EXPECT_EQ((std::vector<Answer>{{"hello", {"2001:db8::1"}}}),
+              send("gethostbyname " + mNetId + " hello " + std::to_string(AF_INET6)));
+}
+
+TEST_F(AnswerCallbackTest, ResNSendReportsTheAnswerBeforeTheAppGetsIt) {
+    test::DNSResponder dns;
+    dns.addMapping(kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4);
+    ASSERT_TRUE(dns.startServer());
+    EXPECT_EQ((std::vector<Answer>{{"hello.example.com", {"::ffff:1.2.3.4"}}}),
+              send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a)));
+}
+
+TEST_F(AnswerCallbackTest, FailedLookupsReportNothing) {
+    test::DNSResponder dns;
+    ASSERT_TRUE(dns.startServer());
+    send("getaddrinfo hello ^ 0 " + std::to_string(AF_INET) + " 0 0 " + mNetId);
+    send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a));
+    EXPECT_EQ(std::vector<Answer>{}, answers());
+}
+
+}  // namespace android::net

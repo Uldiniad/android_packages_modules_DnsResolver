@@ -280,6 +280,7 @@ cc_test {
         "resolv_test_mts_coverage_defaults",
     ],
     srcs: [
+        "resolv_answer_callback_test.cpp",
         "resolv_cache_unit_test.cpp",
         "resolv_callback_unit_test.cpp",
         "resolv_test_callbacks.cpp",

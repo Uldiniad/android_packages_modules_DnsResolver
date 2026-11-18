@@ -206,6 +206,67 @@ int extractResNsendAnswers(std::span<const uint8_t> answer, int ipType,
     return total_ip_addr_count;
 }
 
+in6_addr ipv4Mapped(const in_addr& addr) {
+    in6_addr mapped = {};
+    mapped.s6_addr[10] = 0xff;
+    mapped.s6_addr[11] = 0xff;
+    memcpy(&mapped.s6_addr[12], &addr, sizeof(addr));
+    return mapped;
+}
+
+// Hands netd the addresses an answer is about to give the app, if it asked for them.
+void reportAnswer(const android_net_context& netContext, const char* name,
+                  const std::vector<in6_addr>& addresses) {
+    if (gResNetdCallbacks.on_dns_answer == nullptr || name == nullptr || addresses.empty()) {
+        return;
+    }
+    gResNetdCallbacks.on_dns_answer(netContext, name, addresses.data(), addresses.size());
+}
+
+std::vector<in6_addr> answerAddresses(const addrinfo* result) {
+    std::vector<in6_addr> addresses;
+    for (const addrinfo* ai = result; ai; ai = ai->ai_next) {
+        if (ai->ai_addr == nullptr) continue;
+        if (ai->ai_family == AF_INET) {
+            addresses.push_back(ipv4Mapped(reinterpret_cast<sockaddr_in*>(ai->ai_addr)->sin_addr));
+        } else if (ai->ai_family == AF_INET6) {
+            addresses.push_back(reinterpret_cast<sockaddr_in6*>(ai->ai_addr)->sin6_addr);
+        }
+    }
+    return addresses;
+}
+
+std::vector<in6_addr> answerAddresses(const hostent* hp) {
+    std::vector<in6_addr> addresses;
+    if (hp == nullptr) return addresses;
+    for (int i = 0; hp->h_addr_list[i] != nullptr; i++) {
+        if (hp->h_addrtype == AF_INET) {
+            addresses.push_back(ipv4Mapped(*reinterpret_cast<in_addr*>(hp->h_addr_list[i])));
+        } else if (hp->h_addrtype == AF_INET6) {
+            addresses.push_back(*reinterpret_cast<in6_addr*>(hp->h_addr_list[i]));
+        }
+    }
+    return addresses;
+}
+
+std::vector<in6_addr> answerAddresses(std::span<const uint8_t> answer) {
+    std::vector<in6_addr> addresses;
+    ns_msg handle;
+    if (ns_initparse(answer.data(), answer.size(), &handle) < 0) return addresses;
+    ns_rr rr;
+    for (int i = 0; i < ns_msg_count(handle, ns_s_an); i++) {
+        if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) continue;
+        if (ns_rr_type(rr) == ns_t_a && ns_rr_rdlen(rr) == sizeof(in_addr)) {
+            addresses.push_back(ipv4Mapped(*reinterpret_cast<const in_addr*>(ns_rr_rdata(rr))));
+        } else if (ns_rr_type(rr) == ns_t_aaaa && ns_rr_rdlen(rr) == sizeof(in6_addr)) {
+            in6_addr address;
+            memcpy(&address, ns_rr_rdata(rr), sizeof(address));
+            addresses.push_back(address);
+        }
+    }
+    return addresses;
+}
+
 int extractGetAddrInfoAnswers(const addrinfo* result, std::vector<std::string>* ip_addrs) {
     int total_ip_addr_count = 0;
     if (result == nullptr) {
@@ -899,6 +960,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
             rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, mClient->getSocket(),
                                     &result, &event);
             doDns64Synthesis(&rv, &result, &event);
+            if (rv == 0) reportAnswer(mNetContext, host, answerAddresses(result));
         } else {
             rv = EAI_SYSTEM;
         }
@@ -1112,6 +1174,10 @@ void DnsProxyListener::ResNSendHandler::run() {
             ansLen = resolv_res_nsend(&mNetContext, mClient->getSocket(),
                                       std::span(msg.data(), msgLen), ansBuf, &rcode,
                                       static_cast<ResNsendFlags>(mFlags), &event);
+            if (ansLen > 0) {
+                reportAnswer(mNetContext, rr_name.c_str(),
+                             answerAddresses(std::span(ansBuf.data(), ansLen)));
+            }
         } else {
             // TODO(b/307048182): It should return -errno.
             ansLen = -EAI_SYSTEM;
@@ -1337,6 +1403,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
             rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext,
                                       mClient->getSocket(), &hp, &event);
             doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
+            if (rv == 0) reportAnswer(mNetContext, name, answerAddresses(hp));
         } else {
             rv = EAI_SYSTEM;
         }

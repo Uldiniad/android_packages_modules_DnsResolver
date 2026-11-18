@@ -129,6 +129,23 @@ typedef int (*tagSocketCallback)(int sockFd, uint32_t tag, uid_t uid, pid_t pid)
 typedef bool (*evaluate_domain_name_callback)(
     const android_net_context &netcontext, const char *host);
 
+// The DnsResolver module invokes this callback with each answer it is about to
+// hand to an app, after decrypting it if Private DNS carried it: the name the
+// app asked for and the addresses the app will receive, IPv4 ones IPv4-mapped.
+//
+// If this callback is not present (i.e. set to nullptr), nothing is reported.
+//
+// This callback *will* be invoked concurrently from multiple threads. It must
+// perform its own locking when accessing shared data structures. Furthermore,
+// the callback must not sleep nor perform RPC requests.
+//
+// Be mindful that hostnames could contain sensitive user data. Do not log them
+// and do not transmit them to third parties without explicit user
+// authorization.
+//
+typedef void (*dns_answer_callback)(const android_net_context& netcontext, const char* name,
+                                    const in6_addr* addresses, size_t count);
+
 /*
  * Some functions needed by the resolver (e.g. checkCallingPermission()) live in
  * libraries with no ABI stability guarantees, such as libbinder.so.
@@ -144,6 +161,8 @@ struct ResolverNetdCallbacks {
     tagSocketCallback tagSocket;
     evaluate_domain_name_callback evaluate_domain_name;
     // any future additions go below here, but can only be read with appropriate api checks
+    // LineageOS: may be null
+    dns_answer_callback on_dns_answer;
 };
 
 #define TAG_SYSTEM_DNS 0xFFFFFF82
