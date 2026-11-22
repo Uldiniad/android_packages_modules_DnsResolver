@@ -953,6 +953,7 @@ static struct addrinfo* getanswer(const std::vector<uint8_t>& answer, int anslen
             }
             strlcpy(bp, tbuf, (size_t)(ep - bp));
             canonname = bp;
+            CnameCollector::add(tbuf);
             bp += n;
             continue;
         }

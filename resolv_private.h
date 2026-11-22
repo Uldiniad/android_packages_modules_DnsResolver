@@ -252,6 +252,21 @@ inline void resolv_tag_socket(int sock, uid_t uid, pid_t pid) {
     }
 }
 
+// While in scope, collects the names that answers parsed on this thread point to through CNAME
+// records, for the callback that hears about each answer.
+class CnameCollector {
+  public:
+    explicit CnameCollector(std::vector<std::string>* names) : mPrevious(sNames) { sNames = names; }
+    ~CnameCollector() { sNames = mPrevious; }
+    static void add(const char* name) {
+        if (sNames != nullptr) sNames->emplace_back(name);
+    }
+
+  private:
+    static inline thread_local std::vector<std::string>* sNames = nullptr;
+    std::vector<std::string>* const mPrevious;
+};
+
 struct addrinfo_sort_elem {
     struct addrinfo* ai;
     int has_src_addr;

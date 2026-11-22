@@ -58,6 +58,7 @@
 #include "dnsproxyd_protocol/DnsProxydProtocol.h"  // NETID_USE_LOCAL_NAMESERVERS
 #include "getaddrinfo.h"
 #include "gethnamaddr.h"
+#include "res_comp.h"
 #include "res_send.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
@@ -217,13 +218,35 @@ in6_addr ipv4Mapped(const in_addr& addr) {
     return mapped;
 }
 
-// Hands netd the addresses an answer is about to give the app, if it asked for them.
-void reportAnswer(const android_net_context& netContext, const char* name,
-                  const std::vector<in6_addr>& addresses) {
-    if (gResNetdCallbacks.on_dns_answer == nullptr || name == nullptr || addresses.empty()) {
-        return;
+// Whether netd lets the app have the answer; netd also learns the addresses the answer gives.
+bool answerAllowed(const android_net_context& netContext, const char* name,
+                   const std::vector<std::string>& cnames, const std::vector<in6_addr>& addresses) {
+    if (gResNetdCallbacks.on_dns_answer == nullptr || name == nullptr ||
+        (cnames.empty() && addresses.empty())) {
+        return true;
     }
-    gResNetdCallbacks.on_dns_answer(netContext, name, addresses.data(), addresses.size());
+    std::vector<const char*> names;
+    names.reserve(cnames.size());
+    for (const std::string& cname : cnames) names.push_back(cname.c_str());
+    return gResNetdCallbacks.on_dns_answer(netContext, name, names.data(), names.size(),
+                                           addresses.data(), addresses.size());
+}
+
+std::vector<std::string> answerCnames(std::span<const uint8_t> answer) {
+    std::vector<std::string> names;
+    ns_msg handle;
+    if (ns_initparse(answer.data(), answer.size(), &handle) < 0) return names;
+    ns_rr rr;
+    for (int i = 0; i < ns_msg_count(handle, ns_s_an); i++) {
+        if (ns_parserr(&handle, ns_s_an, i, &rr) < 0 || ns_rr_type(rr) != ns_t_cname) continue;
+        char name[NS_MAXDNAME];
+        if (dn_expand(answer.data(), answer.data() + answer.size(), ns_rr_rdata(rr), name,
+                      sizeof(name)) < 0) {
+            continue;
+        }
+        names.emplace_back(name);
+    }
+    return names;
 }
 
 std::vector<in6_addr> answerAddresses(const addrinfo* result) {
@@ -1013,10 +1036,18 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
         const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
         const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
         if (gResNetdCallbacks.evaluate_domain_name(mNetContext, host)) {
-            rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, mClient->getSocket(),
-                                    &result, &event);
-            doDns64Synthesis(&rv, &result, &event);
-            if (rv == 0) reportAnswer(mNetContext, host, answerAddresses(result));
+            std::vector<std::string> cnames;
+            {
+                CnameCollector collector(&cnames);
+                rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext,
+                                        mClient->getSocket(), &result, &event);
+                doDns64Synthesis(&rv, &result, &event);
+            }
+            if (rv == 0 && !answerAllowed(mNetContext, host, cnames, answerAddresses(result))) {
+                freeaddrinfo(result);
+                result = nullptr;
+                rv = EAI_SYSTEM;
+            }
         } else {
             rv = EAI_SYSTEM;
         }
@@ -1230,9 +1261,11 @@ void DnsProxyListener::ResNSendHandler::run() {
             ansLen = resolv_res_nsend(&mNetContext, mClient->getSocket(),
                                       std::span(msg.data(), msgLen), ansBuf, &rcode,
                                       static_cast<ResNsendFlags>(mFlags), &event);
-            if (ansLen > 0) {
-                reportAnswer(mNetContext, rr_name.c_str(),
-                             answerAddresses(std::span(ansBuf.data(), ansLen)));
+            if (ansLen > 0 &&
+                !answerAllowed(mNetContext, rr_name.c_str(),
+                               answerCnames(std::span(ansBuf.data(), ansLen)),
+                               answerAddresses(std::span(ansBuf.data(), ansLen)))) {
+                ansLen = -EAI_SYSTEM;
             }
         } else {
             // TODO(b/307048182): It should return -errno.
@@ -1456,10 +1489,17 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     } else if (startQueryLimiter(uid)) {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         if (gResNetdCallbacks.evaluate_domain_name(mNetContext, name)) {
-            rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext,
-                                      mClient->getSocket(), &hp, &event);
-            doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
-            if (rv == 0) reportAnswer(mNetContext, name, answerAddresses(hp));
+            std::vector<std::string> cnames;
+            {
+                CnameCollector collector(&cnames);
+                rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext,
+                                          mClient->getSocket(), &hp, &event);
+                doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
+            }
+            if (rv == 0 && !answerAllowed(mNetContext, name, cnames, answerAddresses(hp))) {
+                hp = nullptr;
+                rv = EAI_SYSTEM;
+            }
         } else {
             rv = EAI_SYSTEM;
         }

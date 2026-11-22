@@ -131,9 +131,12 @@ typedef bool (*evaluate_domain_name_callback)(
 
 // The DnsResolver module invokes this callback with each answer it is about to
 // hand to an app, after decrypting it if Private DNS carried it: the name the
-// app asked for and the addresses the app will receive, IPv4 ones IPv4-mapped.
+// app asked for, the names the answer's CNAME records point to in the order it
+// follows them, and the addresses the app will receive, IPv4 ones IPv4-mapped.
+// The app gets the answer only if the callback returns true; otherwise its
+// lookup fails as one that evaluate_domain_name refuses does.
 //
-// If this callback is not present (i.e. set to nullptr), nothing is reported.
+// If this callback is not present (i.e. set to nullptr), every answer is given.
 //
 // This callback *will* be invoked concurrently from multiple threads. It must
 // perform its own locking when accessing shared data structures. Furthermore,
@@ -143,7 +146,8 @@ typedef bool (*evaluate_domain_name_callback)(
 // and do not transmit them to third parties without explicit user
 // authorization.
 //
-typedef void (*dns_answer_callback)(const android_net_context& netcontext, const char* name,
+typedef bool (*dns_answer_callback)(const android_net_context& netcontext, const char* name,
+                                    const char* const* cnames, size_t cname_count,
                                     const in6_addr* addresses, size_t count);
 
 /*

@@ -37,28 +37,35 @@ using android::base::unique_fd;
 struct Answer {
     std::string name;
     std::vector<std::string> addresses;
+    std::vector<std::string> cnames;
     bool operator==(const Answer&) const = default;
 };
 
 void PrintTo(const Answer& answer, std::ostream* os) {
-    *os << answer.name << " " << ::testing::PrintToString(answer.addresses);
+    *os << answer.name << " " << ::testing::PrintToString(answer.addresses) << " "
+        << ::testing::PrintToString(answer.cnames);
 }
 
 std::mutex gLock;
 std::vector<Answer> gAnswers;
 // The uids the answers were for.
 std::vector<uid_t> gUids;
+// Whether netd refuses the answers, as the firewall does those that point to a blocked name.
+bool gRefuse = false;
 
-void recordAnswer(const android_net_context& netcontext, const char* name,
-                  const in6_addr* addresses, size_t count) {
+bool recordAnswer(const android_net_context& netcontext, const char* name,
+                  const char* const* cnames, size_t cnameCount, const in6_addr* addresses,
+                  size_t count) {
     Answer answer = {.name = name};
     for (size_t i = 0; i < count; i++) {
         char text[INET6_ADDRSTRLEN];
         answer.addresses.push_back(inet_ntop(AF_INET6, &addresses[i], text, sizeof(text)));
     }
+    answer.cnames.assign(cnames, cnames + cnameCount);
     std::lock_guard lock(gLock);
     gAnswers.push_back(answer);
     gUids.push_back(netcontext.uid);
+    return !gRefuse;
 }
 
 std::vector<Answer> answers() {
@@ -140,6 +147,7 @@ class AnswerCallbackTest : public NetNativeTestBase {
         std::lock_guard lock(gLock);
         gAnswers.clear();
         gUids.clear();
+        gRefuse = false;
     }
 
     void TearDown() override {
@@ -161,17 +169,29 @@ class AnswerCallbackTest : public NetNativeTestBase {
         std::vector<Answer> reported;
         bool replied = false;
         char buffer[1024];
+        mReply.clear();
         pollfd reply = {.fd = app.get(), .events = POLLIN};
         while (poll(&reply, 1, 5000) == 1) {
             if (!replied) reported = answers();
             replied = true;
-            if (read(app.get(), buffer, sizeof(buffer)) <= 0) break;
+            ssize_t length = read(app.get(), buffer, sizeof(buffer));
+            if (length <= 0) break;
+            mReply.append(buffer, length);
         }
         EXPECT_TRUE(replied);
         return reported;
     }
 
+    // A chain of two CNAME records to the test server's address for hello.example.com.
+    void addCnameChain(test::DNSResponder& dns) {
+        dns.addMapping(kHelloExampleCom, ns_type::ns_t_cname, "alias.example.com.");
+        dns.addMapping("alias.example.com.", ns_type::ns_t_cname, "edge.example.net.");
+        dns.addMapping("edge.example.net.", ns_type::ns_t_a, kHelloExampleComAddrV4);
+    }
+
     const std::string mNetId = std::to_string(TEST_NETID);
+    // The bytes the app got back for the last command.
+    std::string mReply;
 };
 
 TEST_F(AnswerCallbackTest, GetAddrInfoReportsTheAnswerBeforeTheAppGetsIt) {
@@ -212,6 +232,38 @@ TEST_F(AnswerCallbackTest, RequestsAfterForUidAreForThatAppWhenTheCallerMayCharg
     const uid_t app = 99 * AID_USER_OFFSET + AID_APP_START;
     send(std::string(DNSPROXYD_FOR_UID " ") + std::to_string(app) + '\0' + lookup);
     EXPECT_EQ((std::vector<uid_t>{getuid(), app}), uids());
+}
+
+TEST_F(AnswerCallbackTest, AnswersReportTheNamesTheirCnamesPointTo) {
+    test::DNSResponder dns;
+    addCnameChain(dns);
+    ASSERT_TRUE(dns.startServer());
+    const std::vector<std::string> chain = {"alias.example.com", "edge.example.net"};
+    EXPECT_EQ((std::vector<Answer>{{"hello", {"::ffff:1.2.3.4"}, chain}}),
+              send("getaddrinfo hello ^ 0 " + std::to_string(AF_INET) + " " +
+                   std::to_string(SOCK_STREAM) + " 0 " + mNetId));
+    EXPECT_EQ((std::vector<Answer>{{"hello", {"::ffff:1.2.3.4"}, chain},
+                                   {"hello", {"::ffff:1.2.3.4"}, chain}}),
+              send("gethostbyname " + mNetId + " hello " + std::to_string(AF_INET)));
+    send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a));
+    EXPECT_EQ((Answer{"hello.example.com", {"::ffff:1.2.3.4"}, chain}), answers().back());
+}
+
+TEST_F(AnswerCallbackTest, AnAnswerNetdRefusesFailsAsARefusedNameDoes) {
+    test::DNSResponder dns;
+    addCnameChain(dns);
+    ASSERT_TRUE(dns.startServer());
+    gRefuse = true;
+    // DnsProxyOperationFailed instead of DnsProxyQueryResult, with EAI_SYSTEM.
+    send("getaddrinfo hello ^ 0 " + std::to_string(AF_INET) + " " + std::to_string(SOCK_STREAM) +
+         " 0 " + mNetId);
+    EXPECT_EQ("401", mReply.substr(0, 3));
+    send("gethostbyname " + mNetId + " hello " + std::to_string(AF_INET));
+    EXPECT_EQ("401", mReply.substr(0, 3));
+    // -EAI_SYSTEM in place of the rcode, and no answer.
+    send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a));
+    const uint32_t refused = htonl(static_cast<uint32_t>(-EAI_SYSTEM));
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(&refused), sizeof(refused)), mReply);
 }
 
 TEST_F(AnswerCallbackTest, FailedLookupsReportNothing) {

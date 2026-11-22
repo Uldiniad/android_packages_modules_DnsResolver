@@ -221,6 +221,7 @@ static struct hostent* getanswer(const querybuf* _Nonnull answer, int anslen, co
             }
             strlcpy(bp, tbuf, (size_t)(ep - bp));
             hent->h_name = bp;
+            CnameCollector::add(tbuf);
             bp += n;
             continue;
         }
