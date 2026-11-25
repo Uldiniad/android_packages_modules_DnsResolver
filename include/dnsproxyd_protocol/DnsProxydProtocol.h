@@ -31,3 +31,10 @@
  * that app's, if the caller may charge traffic to other apps. It gets no reply of its own.
  */
 #define DNSPROXYD_FOR_UID "foruid"
+
+/*
+ * "forclient <address>", which NetdClient sends ahead of a request on the same connection when
+ * the tethering DNS proxy asks for a device on the phone's hotspot or tethering. The request then
+ * counts as the uid netd gives that device, if netd gives it one. It gets no reply of its own.
+ */
+#define DNSPROXYD_FOR_CLIENT "forclient"

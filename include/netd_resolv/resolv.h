@@ -150,6 +150,10 @@ typedef bool (*dns_answer_callback)(const android_net_context& netcontext, const
                                     const char* const* cnames, size_t cname_count,
                                     const in6_addr* addresses, size_t count);
 
+// The uid that the lookups the tethering DNS proxy makes for the tethered device at the address,
+// IPv4 as IPv4-mapped, count as; -1 when they count as the proxy's own.
+typedef uid_t (*tethering_client_uid_callback)(const in6_addr* address);
+
 /*
  * Some functions needed by the resolver (e.g. checkCallingPermission()) live in
  * libraries with no ABI stability guarantees, such as libbinder.so.
@@ -167,6 +171,7 @@ struct ResolverNetdCallbacks {
     // any future additions go below here, but can only be read with appropriate api checks
     // LineageOS: may be null
     dns_answer_callback on_dns_answer;
+    tethering_client_uid_callback tethering_client_uid;
 };
 
 #define TAG_SYSTEM_DNS 0xFFFFFF82

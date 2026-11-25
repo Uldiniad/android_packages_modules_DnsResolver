@@ -835,6 +835,9 @@ DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
     mForUidCommand = std::make_unique<ForUidCommand>();
     registerCmd(mForUidCommand.get());
 
+    mForClientCommand = std::make_unique<ForClientCommand>();
+    registerCmd(mForClientCommand.get());
+
     if (ADnsHelper_init()) abort();
 }
 
@@ -848,6 +851,29 @@ int DnsProxyListener::ForUidCommand::runCommand(SocketClient* cli, int argc, cha
         LOG(WARNING) << "foruid: UID " << cli->getUid() << " may not act for other apps";
         return 0;
     }
+    std::lock_guard guard(sForUidLock);
+    sForUid[cli] = {cli->getUid(), cli->getPid(), uid};
+    return 0;
+}
+
+DnsProxyListener::ForClientCommand::ForClientCommand() : FrameworkCommand(DNSPROXYD_FOR_CLIENT) {}
+
+// Only the tethering DNS proxy can name a device it asks for, and netd says whose its requests are.
+int DnsProxyListener::ForClientCommand::runCommand(SocketClient* cli, int argc, char** argv) {
+    if (argc != 2 || cli->getUid() != AID_DNS_TETHER || !gResNetdCallbacks.tethering_client_uid) {
+        return 0;
+    }
+    in6_addr address = {};
+    in_addr v4;
+    if (inet_pton(AF_INET, argv[1], &v4) == 1) {
+        address.s6_addr[10] = 0xff;
+        address.s6_addr[11] = 0xff;
+        memcpy(&address.s6_addr[12], &v4, sizeof(v4));
+    } else if (inet_pton(AF_INET6, argv[1], &address) != 1) {
+        return 0;
+    }
+    const uid_t uid = gResNetdCallbacks.tethering_client_uid(&address);
+    if (uid == static_cast<uid_t>(-1)) return 0;
     std::lock_guard guard(sForUidLock);
     sForUid[cli] = {cli->getUid(), cli->getPid(), uid};
     return 0;

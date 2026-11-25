@@ -45,6 +45,7 @@ bool resolv_init(const ResolverNetdCallbacks* callbacks) {
     // if any more fields are added they will need to be copied within api checks
     // LineageOS: netd is always built with this resolver, so it passes the whole struct
     gResNetdCallbacks.on_dns_answer = callbacks->on_dns_answer;
+    gResNetdCallbacks.tethering_client_uid = callbacks->tethering_client_uid;
     android::net::gDnsResolv = android::net::DnsResolver::getInstance();
     return android::net::gDnsResolv->start();
 }

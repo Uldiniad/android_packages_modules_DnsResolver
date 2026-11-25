@@ -8,7 +8,9 @@
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
 #include <poll.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <mutex>
@@ -79,6 +81,18 @@ std::vector<uid_t> uids() {
 }
 
 // What netd gives the resolver for an app's lookup on the network.
+// The tethered client netd gives a uid of its own, and that uid.
+constexpr const char* kTetheredClient = "192.0.2.99";
+constexpr uid_t kTetheredClientUid = 8000;
+
+uid_t tetheringClientUid(const in6_addr* address) {
+    in6_addr client = {};
+    client.s6_addr[10] = client.s6_addr[11] = 0xff;
+    inet_pton(AF_INET, kTetheredClient, &client.s6_addr[12]);
+    return memcmp(address, &client, sizeof(client)) == 0 ? kTetheredClientUid
+                                                         : static_cast<uid_t>(-1);
+}
+
 void networkContext(uint32_t netId, uint32_t uid, android_net_context* netcontext) {
     *netcontext = {.app_netid = netId,
                    .app_mark = MARK_UNSET,
@@ -130,6 +144,7 @@ class AnswerCallbackTest : public NetNativeTestBase {
                 .tagSocket = &noop_tagSocketCallback,
                 .evaluate_domain_name = &noop_evaluateDomainNameCallback,
                 .on_dns_answer = &recordAnswer,
+                .tethering_client_uid = &tetheringClientUid,
         };
         // Fails to listen, as netd holds the dnsproxyd socket, but takes the callbacks.
         resolv_init(&callbacks);
@@ -232,6 +247,23 @@ TEST_F(AnswerCallbackTest, RequestsAfterForUidAreForThatAppWhenTheCallerMayCharg
     const uid_t app = 99 * AID_USER_OFFSET + AID_APP_START;
     send(std::string(DNSPROXYD_FOR_UID " ") + std::to_string(app) + '\0' + lookup);
     EXPECT_EQ((std::vector<uid_t>{getuid(), app}), uids());
+}
+
+TEST_F(AnswerCallbackTest, RequestsAfterForClientAreForTheUidNetdGivesThatClient) {
+    test::DNSResponder dns;
+    dns.addMapping(kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4);
+    ASSERT_TRUE(dns.startServer());
+    const std::string lookup = "getaddrinfo hello ^ 0 " + std::to_string(AF_INET) + " " +
+                               std::to_string(SOCK_STREAM) + " 0 " + mNetId;
+    const std::string forClient = std::string(DNSPROXYD_FOR_CLIENT " ") + kTetheredClient + '\0';
+    // Only the tethering DNS proxy may name the client it asks for.
+    send(forClient + lookup);
+    // The socket pair takes the uid it's made with, as dnsmasq's connection has dnsmasq's.
+    ASSERT_EQ(0, seteuid(AID_DNS_TETHER));
+    send(forClient + lookup);
+    send(std::string(DNSPROXYD_FOR_CLIENT " 192.0.2.98") + '\0' + lookup);
+    ASSERT_EQ(0, seteuid(0));
+    EXPECT_EQ((std::vector<uid_t>{0, kTetheredClientUid, AID_DNS_TETHER}), uids());
 }
 
 TEST_F(AnswerCallbackTest, AnswersReportTheNamesTheirCnamesPointTo) {

@@ -173,6 +173,14 @@ class DnsProxyListener : public FrameworkListener {
         int runCommand(SocketClient* c, int argc, char** argv) override;
     };
 
+    /* ------ forclient ------*/
+    class ForClientCommand : public FrameworkCommand {
+      public:
+        ForClientCommand();
+        virtual ~ForClientCommand() {}
+        int runCommand(SocketClient* c, int argc, char** argv) override;
+    };
+
   protected:
     bool onDataAvailable(SocketClient* c) override;
 
@@ -183,6 +191,7 @@ class DnsProxyListener : public FrameworkListener {
     std::unique_ptr<ResNSendCommand> mResNSendCommand;
     std::unique_ptr<GetDnsNetIdCommand> mGetDnsNetIdCommand;
     std::unique_ptr<ForUidCommand> mForUidCommand;
+    std::unique_ptr<ForClientCommand> mForClientCommand;
 };
 
 }  // namespace net
