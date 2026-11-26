@@ -232,6 +232,117 @@ bool answerAllowed(const android_net_context& netContext, const char* name,
                                            addresses.data(), addresses.size());
 }
 
+// The name netd has looked up in place of the one the app asked for, if any.
+bool replacementName(const android_net_context& netContext, const char* name,
+                     std::string* replacement) {
+    if (gResNetdCallbacks.query_name == nullptr || name == nullptr) return false;
+    char buffer[NS_MAXDNAME] = {};
+    if (!gResNetdCallbacks.query_name(netContext, name, buffer, sizeof(buffer))) return false;
+    buffer[sizeof(buffer) - 1] = '\0';
+    *replacement = buffer;
+    return !replacement->empty();
+}
+
+// Writes into a packet being built, as long as it fits.
+class PacketWriter {
+  public:
+    explicit PacketWriter(std::span<uint8_t> out) : mOut(out), mAt(HFIXEDSZ) {
+        mNames[0] = out.data();
+    }
+
+    bool name(const char* text) {
+        int n = dn_comp(text, mOut.data() + mAt, mOut.size() - mAt, mNames,
+                        mNames + std::size(mNames));
+        if (n < 0) return false;
+        mAt += n;
+        return true;
+    }
+
+    bool u16(uint16_t value) {
+        const uint8_t data[] = {static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value)};
+        return bytes(data);
+    }
+
+    bool u32(uint32_t value) { return u16(value >> 16) && u16(value & 0xffff); }
+
+    bool bytes(std::span<const uint8_t> data) {
+        if (mOut.size() - mAt < data.size()) return false;
+        memcpy(mOut.data() + mAt, data.data(), data.size());
+        mAt += data.size();
+        return true;
+    }
+
+    // Fills in a record's data length once its data is written, from where the length went.
+    void length(size_t at) {
+        size_t length = mAt - at - 2;
+        mOut[at] = length >> 8;
+        mOut[at + 1] = length & 0xff;
+    }
+
+    size_t at() const { return mAt; }
+
+  private:
+    std::span<uint8_t> mOut;
+    size_t mAt;
+    uint8_t* mNames[64] = {};
+};
+
+// The answer to the app's question, from the answer about the name looked up in place of its
+// own: its question, a CNAME record from its name to that one, then that answer's records. The
+// header, with its flags and code, is the answer's. Returns the answer's length, or -1.
+int answerAsAsked(std::span<const uint8_t> answer, const std::string& asked, int type,
+                  const std::string& replacement, std::span<uint8_t> out) {
+    ns_msg handle;
+    if (ns_initparse(answer.data(), answer.size(), &handle) < 0 || out.size() < HFIXEDSZ) {
+        return -1;
+    }
+    const int count = ns_msg_count(handle, ns_s_an);
+    std::vector<ns_rr> records(count);
+    // The CNAME record lasts as long as the records it leads to.
+    uint32_t ttl = 0;
+    for (int i = 0; i < count; i++) {
+        if (ns_parserr(&handle, ns_s_an, i, &records[i]) < 0) return -1;
+        const uint32_t recordTtl = static_cast<uint32_t>(ns_rr_ttl(records[i]));
+        ttl = i == 0 ? recordTtl : std::min(ttl, recordTtl);
+    }
+    memcpy(out.data(), answer.data(), HFIXEDSZ);
+    PacketWriter packet(out);
+    if (!packet.name(asked.c_str()) || !packet.u16(type) || !packet.u16(ns_c_in)) return -1;
+    if (!packet.name(asked.c_str()) || !packet.u16(ns_t_cname) || !packet.u16(ns_c_in) ||
+        !packet.u32(ttl)) {
+        return -1;
+    }
+    size_t length = packet.at();
+    if (!packet.u16(0) || !packet.name(replacement.c_str())) return -1;
+    packet.length(length);
+    for (const ns_rr& rr : records) {
+        if (!packet.name(ns_rr_name(rr)) || !packet.u16(ns_rr_type(rr)) ||
+            !packet.u16(ns_rr_class(rr)) || !packet.u32(static_cast<uint32_t>(ns_rr_ttl(rr)))) {
+            return -1;
+        }
+        length = packet.at();
+        if (!packet.u16(0)) return -1;
+        // A CNAME record's name may point elsewhere in the answer, which this one doesn't have.
+        if (ns_rr_type(rr) == ns_t_cname) {
+            char target[NS_MAXDNAME];
+            if (dn_expand(ns_msg_base(handle), ns_msg_end(handle), ns_rr_rdata(rr), target,
+                          sizeof(target)) < 0 ||
+                !packet.name(target)) {
+                return -1;
+            }
+        } else if (!packet.bytes(std::span(ns_rr_rdata(rr), ns_rr_rdlen(rr)))) {
+            return -1;
+        }
+        packet.length(length);
+    }
+    HEADER* header = reinterpret_cast<HEADER*>(out.data());
+    header->qdcount = htons(1);
+    header->ancount = htons(count + 1);
+    header->nscount = 0;
+    header->arcount = 0;
+    return packet.at();
+}
+
 std::vector<std::string> answerCnames(std::span<const uint8_t> answer) {
     std::vector<std::string> names;
     ns_msg handle;
@@ -1063,12 +1174,24 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
         const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
         if (gResNetdCallbacks.evaluate_domain_name(mNetContext, host)) {
             std::vector<std::string> cnames;
+            // A name netd has looked up in place of the app's stands in mHost while the lookup
+            // runs, as DNS64 synthesis asks for it again, and leads the names the answer points
+            // to.
+            const std::string asked = mHost;
+            std::string replacement;
+            if (replacementName(mNetContext, host, &replacement)) {
+                mHost = replacement;
+                cnames.push_back(replacement);
+            }
             {
                 CnameCollector collector(&cnames);
-                rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext,
-                                        mClient->getSocket(), &result, &event);
+                rv = resolv_getaddrinfo(host == nullptr ? nullptr : mHost.c_str(), service,
+                                        mHints.get(), &mNetContext, mClient->getSocket(),
+                                        &result, &event);
                 doDns64Synthesis(&rv, &result, &event);
             }
+            mHost = asked;
+            host = host == nullptr ? nullptr : mHost.c_str();
             if (rv == 0 && !answerAllowed(mNetContext, host, cnames, answerAddresses(result))) {
                 freeaddrinfo(result);
                 result = nullptr;
@@ -1284,9 +1407,31 @@ void DnsProxyListener::ResNSendHandler::run() {
         ansLen = -ECONNREFUSED;
     } else if (startQueryLimiter(uid)) {
         if (gResNetdCallbacks.evaluate_domain_name(mNetContext, rr_name.c_str())) {
-            ansLen = resolv_res_nsend(&mNetContext, mClient->getSocket(),
-                                      std::span(msg.data(), msgLen), ansBuf, &rcode,
-                                      static_cast<ResNsendFlags>(mFlags), &event);
+            // A name netd looks up in place of the app's is asked about instead, and the
+            // answer about it given as one about the app's name.
+            std::string replacement;
+            std::vector<uint8_t> replacementQuery(MAXPACKET, 0);
+            std::span<const uint8_t> query(msg.data(), msgLen);
+            const bool replaced = replacementName(mNetContext, rr_name.c_str(), &replacement);
+            if (replaced) {
+                const int length = res_nmkquery(ns_o_query, replacement.c_str(), ns_c_in, rr_type,
+                                                {}, replacementQuery, mNetContext.flags);
+                query = std::span(replacementQuery.data(), std::max(length, 0));
+            }
+            ansLen = query.empty() ? -EAI_SYSTEM
+                                   : resolv_res_nsend(&mNetContext, mClient->getSocket(), query,
+                                                      ansBuf, &rcode,
+                                                      static_cast<ResNsendFlags>(mFlags), &event);
+            if (replaced && ansLen > 0) {
+                std::vector<uint8_t> asAsked(MAXPACKET, 0);
+                ansLen = answerAsAsked(std::span(ansBuf.data(), ansLen), rr_name, rr_type,
+                                       replacement, asAsked);
+                if (ansLen > 0) {
+                    ansBuf = std::move(asAsked);
+                } else {
+                    ansLen = -EAI_SYSTEM;
+                }
+            }
             if (ansLen > 0 &&
                 !answerAllowed(mNetContext, rr_name.c_str(),
                                answerCnames(std::span(ansBuf.data(), ansLen)),
@@ -1516,12 +1661,22 @@ void DnsProxyListener::GetHostByNameHandler::run() {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         if (gResNetdCallbacks.evaluate_domain_name(mNetContext, name)) {
             std::vector<std::string> cnames;
+            // As for getaddrinfo, with mName.
+            const std::string asked = mName;
+            std::string replacement;
+            if (replacementName(mNetContext, name, &replacement)) {
+                mName = replacement;
+                cnames.push_back(replacement);
+            }
             {
                 CnameCollector collector(&cnames);
-                rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext,
+                rv = resolv_gethostbyname(name == nullptr ? nullptr : mName.c_str(), mAf, &hbuf,
+                                          tmpbuf, sizeof tmpbuf, &mNetContext,
                                           mClient->getSocket(), &hp, &event);
                 doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
             }
+            mName = asked;
+            name = name == nullptr ? nullptr : mName.c_str();
             if (rv == 0 && !answerAllowed(mNetContext, name, cnames, answerAddresses(hp))) {
                 hp = nullptr;
                 rv = EAI_SYSTEM;

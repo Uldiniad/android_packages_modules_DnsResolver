@@ -154,6 +154,25 @@ typedef bool (*dns_answer_callback)(const android_net_context& netcontext, const
 // IPv4 as IPv4-mapped, count as; -1 when they count as the proxy's own.
 typedef uid_t (*tethering_client_uid_callback)(const in6_addr* address);
 
+// The DnsResolver module invokes this callback with each name an app looks up, after
+// evaluate_domain_name lets it. To have another name looked up in its place, the callback writes
+// that name, NUL-terminated, into the buffer of the given size and returns true; the app then
+// gets that name's answer, under a CNAME record from the name it asked for, as DNS resolvers
+// that enforce search engines' safe search do. Returning false leaves the lookup as it is.
+//
+// If this callback is not present (i.e. set to nullptr), every name is looked up as asked.
+//
+// This callback *will* be invoked concurrently from multiple threads. It must
+// perform its own locking when accessing shared data structures. Furthermore,
+// the callback must not sleep nor perform RPC requests.
+//
+// Be mindful that hostnames could contain sensitive user data. Do not log them
+// and do not transmit them to third parties without explicit user
+// authorization.
+//
+typedef bool (*query_name_callback)(const android_net_context& netcontext, const char* name,
+                                    char* buffer, size_t size);
+
 /*
  * Some functions needed by the resolver (e.g. checkCallingPermission()) live in
  * libraries with no ABI stability guarantees, such as libbinder.so.
@@ -172,6 +191,7 @@ struct ResolverNetdCallbacks {
     // LineageOS: may be null
     dns_answer_callback on_dns_answer;
     tethering_client_uid_callback tethering_client_uid;
+    query_name_callback query_name;
 };
 
 #define TAG_SYSTEM_DNS 0xFFFFFF82

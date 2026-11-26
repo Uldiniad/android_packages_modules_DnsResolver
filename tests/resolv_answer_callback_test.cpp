@@ -27,6 +27,7 @@
 #include "DnsProxyListener.h"
 #include "DnsResolver.h"
 #include "dnsproxyd_protocol/DnsProxydProtocol.h"
+#include "res_comp.h"
 #include "tests/dns_responder/dns_responder.h"
 #include "tests/resolv_test_callbacks.h"
 #include "tests/resolv_test_utils.h"
@@ -296,6 +297,59 @@ TEST_F(AnswerCallbackTest, AnAnswerNetdRefusesFailsAsARefusedNameDoes) {
     send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a));
     const uint32_t refused = htonl(static_cast<uint32_t>(-EAI_SYSTEM));
     EXPECT_EQ(std::string(reinterpret_cast<const char*>(&refused), sizeof(refused)), mReply);
+}
+
+// netd's name in place of hello.example.com, as a firewall has search engines' safe-search
+// names looked up in place of theirs.
+bool replaceHello(const android_net_context&, const char* name, char* buffer, size_t size) {
+    if (strcmp(name, "hello.example.com") != 0) return false;
+    strlcpy(buffer, "safe.example.com", size);
+    return true;
+}
+
+TEST_F(AnswerCallbackTest, ANameNetdReplacesGetsTheOtherNamesAnswerUnderACname) {
+    test::DNSResponder dns;
+    dns.addMapping(kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4);
+    dns.addMapping("safe.example.com.", ns_type::ns_t_a, "1.2.3.5");
+    dns.addMapping("other.example.com.", ns_type::ns_t_a, kHelloExampleComAddrV4);
+    ASSERT_TRUE(dns.startServer());
+    gResNetdCallbacks.query_name = &replaceHello;
+    const Answer safe = {"hello.example.com", {"::ffff:1.2.3.5"}, {"safe.example.com"}};
+    send("getaddrinfo hello.example.com ^ 0 " + std::to_string(AF_INET) + " " +
+         std::to_string(SOCK_STREAM) + " 0 " + mNetId);
+    EXPECT_EQ(safe, answers().back());
+    send("gethostbyname " + mNetId + " hello.example.com " + std::to_string(AF_INET));
+    EXPECT_EQ(safe, answers().back());
+
+    // A raw query gets back its own question, answered by a CNAME record to the other name, then
+    // that name's records: after the rcode and the length, as the reply frames them.
+    send("resnsend " + mNetId + " 0 " + query("hello.example.com", ns_type::ns_t_a));
+    EXPECT_EQ(safe, answers().back());
+    ASSERT_GT(mReply.size(), 8u);
+    ns_msg handle;
+    ASSERT_EQ(0, ns_initparse(reinterpret_cast<const uint8_t*>(mReply.data()) + 8,
+                              mReply.size() - 8, &handle));
+    EXPECT_EQ(0x1234, ns_msg_id(handle));
+    ns_rr rr;
+    ASSERT_EQ(0, ns_parserr(&handle, ns_s_qd, 0, &rr));
+    EXPECT_STREQ("hello.example.com", ns_rr_name(rr));
+    EXPECT_EQ(ns_t_a, ns_rr_type(rr));
+    ASSERT_EQ(2, ns_msg_count(handle, ns_s_an));
+    ASSERT_EQ(0, ns_parserr(&handle, ns_s_an, 0, &rr));
+    EXPECT_STREQ("hello.example.com", ns_rr_name(rr));
+    ASSERT_EQ(ns_t_cname, ns_rr_type(rr));
+    char target[NS_MAXDNAME];
+    ASSERT_LT(0, dn_expand(ns_msg_base(handle), ns_msg_end(handle), ns_rr_rdata(rr), target,
+                           sizeof(target)));
+    EXPECT_STREQ("safe.example.com", target);
+    ASSERT_EQ(0, ns_parserr(&handle, ns_s_an, 1, &rr));
+    EXPECT_STREQ("safe.example.com", ns_rr_name(rr));
+    EXPECT_EQ(ns_t_a, ns_rr_type(rr));
+
+    // Other names are looked up as asked.
+    send("getaddrinfo other.example.com ^ 0 " + std::to_string(AF_INET) + " " +
+         std::to_string(SOCK_STREAM) + " 0 " + mNetId);
+    EXPECT_EQ((Answer{"other.example.com", {"::ffff:1.2.3.4"}}), answers().back());
 }
 
 TEST_F(AnswerCallbackTest, FailedLookupsReportNothing) {
